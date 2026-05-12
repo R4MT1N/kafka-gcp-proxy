@@ -46,6 +46,8 @@ var Server = &cobra.Command{
 	Short: "Run the kafka-gcp-proxy server",
 	PreRunE: func(cmd *cobra.Command, args []string) error {
 		SetLogger()
+		// This binary only speaks SASL/OAUTHBEARER — there is no opt-out.
+		c.Kafka.SASL.Enable = true
 		if err := c.InitBootstrapServers(getOrEnvStringSlice(bootstrapServersMapping, "BOOTSTRAP_SERVER_MAPPING")); err != nil {
 			return err
 		}
