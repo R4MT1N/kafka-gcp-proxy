@@ -158,7 +158,11 @@ func (b *SASLOAuthBearerAuth) sendSaslAuthenticateRequest(token string, conn Dea
 		return fmt.Errorf("failed to parse SASL auth response: %w", err)
 	}
 	if !errors.Is(res.Err, protocol.ErrNoError) {
-		return fmt.Errorf("SASL authentication failed, error message is '%v'", res.ErrMsg)
+		errMsg := ""
+		if res.ErrMsg != nil {
+			errMsg = *res.ErrMsg
+		}
+		return fmt.Errorf("SASL authentication failed: %v (broker: %q)", res.Err, errMsg)
 	}
 	return nil
 }
