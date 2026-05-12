@@ -58,14 +58,20 @@ func TestGetToken_RefreshAfterExpiry(t *testing.T) {
 		{AccessToken: "expired", Expiry: time.Now().Add(-time.Minute)},
 		{AccessToken: "refreshed", Expiry: time.Now().Add(time.Hour)},
 	}}
-	// Wrap in ReuseTokenSource exactly as production code does. ReuseTokenSource
-	// will call the underlying source again once the first token is past expiry.
+	// Wrap in ReuseTokenSource exactly as production code does. The first
+	// GetToken call seeds the cache with the expired token (ReuseTokenSource
+	// returns whatever source.Token() yields); the second call sees the
+	// cached token is past expiry and re-fetches from the underlying source.
 	reusable := oauth2.ReuseTokenSource(nil, src)
 	p := &TokenProvider{timeout: 10 * time.Second, source: reusable}
 
-	resp, err := p.GetToken(context.Background(), apis.TokenRequest{})
+	first, err := p.GetToken(context.Background(), apis.TokenRequest{})
 	a.Nil(err)
-	a.Equal("refreshed", resp.Token, "ReuseTokenSource should skip the expired token and fetch a fresh one")
+	a.Equal("expired", first.Token)
+
+	second, err := p.GetToken(context.Background(), apis.TokenRequest{})
+	a.Nil(err)
+	a.Equal("refreshed", second.Token, "ReuseTokenSource should refresh once the cached token is past expiry")
 }
 
 func TestGetToken_FetchFailureFailsClosed(t *testing.T) {
