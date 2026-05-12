@@ -16,14 +16,13 @@ RUN mkdir -p build && \
 
 FROM alpine:3.21
 
-RUN apk add --no-cache ca-certificates libcap && \
+RUN apk add --no-cache ca-certificates && \
     adduser --disabled-password --gecos "" \
             --home "/nonexistent" --shell "/sbin/nologin" \
-            --no-create-home kafka-gcp-proxy
+            --no-create-home --uid 1000 kafka-gcp-proxy
 
 COPY --from=builder /go/src/github.com/R4MT1N/kafka-gcp-proxy/build /opt/kafka-gcp-proxy/bin
-RUN setcap 'cap_net_bind_service=+ep' /opt/kafka-gcp-proxy/bin/kafka-gcp-proxy
 
-USER kafka-gcp-proxy
+USER 1000
 ENTRYPOINT ["/opt/kafka-gcp-proxy/bin/kafka-gcp-proxy"]
 CMD ["--help"]
