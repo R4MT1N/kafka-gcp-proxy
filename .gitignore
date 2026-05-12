@@ -1,0 +1,4 @@
+build/
+/kafka-gcp-proxy
+.idea/
+.vscode/
