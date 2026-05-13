@@ -104,6 +104,8 @@ type ConnectionAuthState struct {
 	// Deadline after which we give up on the in-flight re-auth and tear down
 	// the connection. Bound by reauthInflightCushion.
 	inFlightDeadline time.Time
+	// Time the in-flight re-auth was started — for the duration histogram.
+	inFlightStartedAt time.Time
 	// Latest session lifetime advertised by the broker. Used for both initial
 	// scheduling and re-scheduling after each successful re-auth.
 	sessionLifetime time.Duration
@@ -157,6 +159,15 @@ func (s *ConnectionAuthState) MarkInFlight(now time.Time) {
 	defer s.mu.Unlock()
 	s.inFlight = true
 	s.inFlightDeadline = now.Add(reauthInflightCushion)
+	s.inFlightStartedAt = now
+}
+
+// InFlightStartedAt returns the moment MarkInFlight was last called, or zero
+// if no re-auth is in flight. Used by the response handler to record duration.
+func (s *ConnectionAuthState) InFlightStartedAt() time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.inFlightStartedAt
 }
 
 // CompleteReauth applies a newly-advertised session lifetime from the broker.
@@ -330,16 +341,19 @@ func (r *RequestsLoopContext) runReauth(dst DeadlineWriter) error {
 	if !r.authState.NeedsReauth(now) {
 		return nil
 	}
+	proxyReauthAttemptsTotal.WithLabelValues(r.brokerAddress).Inc()
+
 	reqBytes, err := r.saslAuthByProxy.buildReauthRequest(reauthCorrelationID)
 	if err != nil {
-		// Fail loud — we'd rather close the connection than serve traffic on
-		// a credential that's about to expire.
+		proxyReauthFailuresTotal.WithLabelValues(r.brokerAddress, ReauthReasonTokenFetch).Inc()
 		return err
 	}
 	if err := dst.SetWriteDeadline(now.Add(r.timeout)); err != nil {
+		proxyReauthFailuresTotal.WithLabelValues(r.brokerAddress, ReauthReasonBrokerWrite).Inc()
 		return err
 	}
 	if _, err := dst.Write(reqBytes); err != nil {
+		proxyReauthFailuresTotal.WithLabelValues(r.brokerAddress, ReauthReasonBrokerWrite).Inc()
 		return err
 	}
 	// Mark in-flight before publishing onto the channels so the request loop
@@ -350,11 +364,13 @@ func (r *RequestsLoopContext) runReauth(dst DeadlineWriter) error {
 	select {
 	case r.openRequestsChannel <- protocol.RequestKeyVersion{ApiKey: apiKeySaslAuthenticate, ApiVersion: saslAuthenticateRequestVersion}:
 	default:
+		proxyReauthFailuresTotal.WithLabelValues(r.brokerAddress, ReauthReasonChannelFull).Inc()
 		return errors.New("re-auth: openRequestsChannel full")
 	}
 	select {
 	case r.nextResponseHandlerChannel <- saslReauthResponseHandler:
 	default:
+		proxyReauthFailuresTotal.WithLabelValues(r.brokerAddress, ReauthReasonChannelFull).Inc()
 		return errors.New("re-auth: nextResponseHandlerChannel full")
 	}
 	logrus.Debugf("re-auth: SaslAuthenticate v1 sent to %s", r.brokerAddress)
@@ -365,6 +381,8 @@ func (r *RequestsLoopContext) requestsLoop(dst DeadlineWriter, src DeadlineReade
 	var nextRequestHandler RequestHandler
 	for {
 		if r.authState != nil && r.authState.InFlightExpired(time.Now()) {
+			proxyReauthFailuresTotal.WithLabelValues(r.brokerAddress, ReauthReasonResponseStuck).Inc()
+			proxyConnectionTeardownTotal.WithLabelValues(r.brokerAddress, "reauth_response_timeout").Inc()
 			return false, errors.New("re-auth response did not arrive within cushion window — connection wedged")
 		}
 		if nextRequestHandler, err = r.getNextRequestHandler(); err != nil {
@@ -460,19 +478,23 @@ func (h *SaslReauthResponseHandler) handleResponse(dst DeadlineWriter, src Deadl
 	// Standard length-prefixed frame: Size:int32, CorrelationID:int32, body.
 	header := make([]byte, 8)
 	if _, err = io.ReadFull(src, header); err != nil {
+		proxyReauthFailuresTotal.WithLabelValues(ctx.brokerAddress, ReauthReasonResponseDecode).Inc()
 		return true, err
 	}
 	length := binary.BigEndian.Uint32(header[:4])
 	if length < 4 {
+		proxyReauthFailuresTotal.WithLabelValues(ctx.brokerAddress, ReauthReasonResponseDecode).Inc()
 		return true, errors.New("re-auth: response too short")
 	}
 	payload := make([]byte, length-4)
 	if _, err = io.ReadFull(src, payload); err != nil {
+		proxyReauthFailuresTotal.WithLabelValues(ctx.brokerAddress, ReauthReasonResponseDecode).Inc()
 		return true, err
 	}
 
 	res := &protocol.SaslAuthenticateResponseV1{}
 	if err := protocol.Decode(payload, res); err != nil {
+		proxyReauthFailuresTotal.WithLabelValues(ctx.brokerAddress, ReauthReasonResponseDecode).Inc()
 		return true, err
 	}
 	if !errors.Is(res.Err, protocol.ErrNoError) {
@@ -480,14 +502,25 @@ func (h *SaslReauthResponseHandler) handleResponse(dst DeadlineWriter, src Deadl
 		if res.ErrMsg != nil {
 			errMsg = *res.ErrMsg
 		}
+		proxyReauthFailuresTotal.WithLabelValues(ctx.brokerAddress, ReauthReasonBrokerReject).Inc()
+		proxyConnectionTeardownTotal.WithLabelValues(ctx.brokerAddress, "reauth_broker_reject").Inc()
 		// The connection is about to be force-closed by the broker. Tear it
 		// down here so the client reconnects rather than continuing to send
 		// requests that will silently fail.
 		return false, errors.New("re-auth: broker rejected refreshed credentials: " + res.Err.Error() + " (" + errMsg + ")")
 	}
 
+	// Record latency *before* we update the state, since CompleteReauth
+	// clears inFlightStartedAt.
 	if ctx.authState != nil {
+		if startedAt := ctx.authState.InFlightStartedAt(); !startedAt.IsZero() {
+			proxyReauthDurationSeconds.WithLabelValues(ctx.brokerAddress).Observe(time.Since(startedAt).Seconds())
+		}
 		ctx.authState.CompleteReauth(res.SessionLifetimeMs)
+	}
+	proxyReauthSuccessTotal.WithLabelValues(ctx.brokerAddress).Inc()
+	if res.SessionLifetimeMs > 0 {
+		proxyReauthSessionLifetimeSeconds.WithLabelValues(ctx.brokerAddress).Set(float64(res.SessionLifetimeMs) / 1000.0)
 	}
 	logrus.Debugf("re-auth: succeeded on %s, session_lifetime_ms=%d", ctx.brokerAddress, res.SessionLifetimeMs)
 	return false, nil

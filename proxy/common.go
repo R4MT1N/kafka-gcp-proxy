@@ -122,7 +122,9 @@ func copyThenClose(cfg ProcessorConfig, remote, local DeadlineReadWriteCloser, b
 		readErr, err := processor.RequestsLoop(remote, local)
 		select {
 		case firstErr <- err:
-			if readErr && err == io.EOF {
+			reason := classifyTeardown(readErr, err)
+			proxyConnectionTeardownTotal.WithLabelValues(brokerAddress, reason).Inc()
+			if reason == "client_eof" {
 				logrus.Infof("Client closed %v", localDesc)
 			} else {
 				copyError(localDesc, remoteDesc, readErr, err)
@@ -136,7 +138,14 @@ func copyThenClose(cfg ProcessorConfig, remote, local DeadlineReadWriteCloser, b
 	readErr, err := processor.ResponsesLoop(local, remote)
 	select {
 	case firstErr <- err:
-		if readErr && err == io.EOF {
+		reason := classifyTeardown(readErr, err)
+		// classifyTeardown returns "client_eof" when readErr is set, but in
+		// this branch the read came from the broker — call it "broker_eof".
+		if reason == "client_eof" {
+			reason = "broker_eof"
+		}
+		proxyConnectionTeardownTotal.WithLabelValues(brokerAddress, reason).Inc()
+		if reason == "broker_eof" {
 			logrus.Infof("Server %v closed connection", remoteDesc)
 		} else {
 			copyError(remoteDesc, localDesc, readErr, err)
@@ -146,6 +155,23 @@ func copyThenClose(cfg ProcessorConfig, remote, local DeadlineReadWriteCloser, b
 	default:
 		// In this case, the other goroutine exited first and already printed its
 		// error (and closed the things).
+	}
+}
+
+// classifyTeardown maps a (readErr, err) pair from one of the proxy loops to a
+// stable Prometheus label so operators can alert on abnormal teardowns
+// (anything that isn't a clean EOF from one side). The label set is small on
+// purpose — the cardinality stays bounded.
+func classifyTeardown(readErr bool, err error) string {
+	switch {
+	case err == nil:
+		return "clean"
+	case readErr && err == io.EOF:
+		return "client_eof"
+	case err == io.EOF:
+		return "eof_write_side"
+	default:
+		return "error"
 	}
 }
 

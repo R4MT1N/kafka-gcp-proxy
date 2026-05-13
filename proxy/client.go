@@ -187,6 +187,9 @@ func (c *Client) handleConn(conn Conn) {
 	cfg := c.processorConfig
 	cfg.InitialSessionLifetimeMs = sessionLifetimeMs
 	cfg.SaslAuthByProxy = c.saslAuthByProxy
+	if sessionLifetimeMs > 0 {
+		proxyReauthSessionLifetimeSeconds.WithLabelValues(conn.BrokerAddress).Set(float64(sessionLifetimeMs) / 1000.0)
+	}
 	copyThenClose(cfg, server, conn.LocalConnection, conn.BrokerAddress, conn.BrokerAddress, localDesc)
 	if err := c.conns.Remove(conn.BrokerAddress, conn.LocalConnection); err != nil {
 		logrus.Info(err)
