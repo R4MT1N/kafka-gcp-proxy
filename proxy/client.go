@@ -169,7 +169,7 @@ func (c *Client) handleConn(conn Conn) {
 		logrus.Infof("Dial address changed from %s to %s", conn.BrokerAddress, dialAddress)
 	}
 
-	server, err := c.DialAndAuth(dialAddress)
+	server, sessionLifetimeMs, err := c.DialAndAuth(dialAddress)
 	if err != nil {
 		logrus.Infof("couldn't connect to %s(%s): %v", dialAddress, conn.BrokerAddress, err)
 		_ = conn.LocalConnection.Close()
@@ -182,37 +182,45 @@ func (c *Client) handleConn(conn Conn) {
 	}
 	c.conns.Add(conn.BrokerAddress, conn.LocalConnection)
 	localDesc := "local connection on " + conn.LocalConnection.LocalAddr().String() + " from " + conn.LocalConnection.RemoteAddr().String() + " (" + conn.BrokerAddress + ")"
-	copyThenClose(c.processorConfig, server, conn.LocalConnection, conn.BrokerAddress, conn.BrokerAddress, localDesc)
+	// Per-connection config: same static processor settings + the freshly
+	// negotiated session lifetime + the auth handle used for in-flight reauth.
+	cfg := c.processorConfig
+	cfg.InitialSessionLifetimeMs = sessionLifetimeMs
+	cfg.SaslAuthByProxy = c.saslAuthByProxy
+	copyThenClose(cfg, server, conn.LocalConnection, conn.BrokerAddress, conn.BrokerAddress, localDesc)
 	if err := c.conns.Remove(conn.BrokerAddress, conn.LocalConnection); err != nil {
 		logrus.Info(err)
 	}
 }
 
-func (c *Client) DialAndAuth(brokerAddress string) (net.Conn, error) {
+func (c *Client) DialAndAuth(brokerAddress string) (net.Conn, int64, error) {
 	conn, err := c.dialer.Dial("tcp", brokerAddress)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	if err := conn.SetDeadline(time.Time{}); err != nil {
 		_ = conn.Close()
-		return nil, err
+		return nil, 0, err
 	}
-	if err := c.auth(conn, brokerAddress); err != nil {
-		return nil, err
+	sessionLifetimeMs, err := c.auth(conn, brokerAddress)
+	if err != nil {
+		return nil, 0, err
 	}
-	return conn, nil
+	return conn, sessionLifetimeMs, nil
 }
 
-func (c *Client) auth(conn net.Conn, brokerAddress string) error {
-	if c.config.Kafka.SASL.Enable {
-		if err := c.saslAuthByProxy.sendAndReceiveSASLAuth(conn, brokerAddress); err != nil {
-			_ = conn.Close()
-			return err
-		}
-		if err := conn.SetDeadline(time.Time{}); err != nil {
-			_ = conn.Close()
-			return err
-		}
+func (c *Client) auth(conn net.Conn, brokerAddress string) (int64, error) {
+	if !c.config.Kafka.SASL.Enable {
+		return 0, nil
 	}
-	return nil
+	sessionLifetimeMs, err := c.saslAuthByProxy.sendAndReceiveSASLAuth(conn, brokerAddress)
+	if err != nil {
+		_ = conn.Close()
+		return 0, err
+	}
+	if err := conn.SetDeadline(time.Time{}); err != nil {
+		_ = conn.Close()
+		return 0, err
+	}
+	return sessionLifetimeMs, nil
 }

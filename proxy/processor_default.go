@@ -4,14 +4,27 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"github.com/R4MT1N/kafka-gcp-proxy/proxy/protocol"
-	"github.com/sirupsen/logrus"
 	"io"
+	"os"
 	"strconv"
 	"time"
+
+	"github.com/R4MT1N/kafka-gcp-proxy/proxy/protocol"
+	"github.com/sirupsen/logrus"
 )
 
 type DefaultRequestHandler struct {
+}
+
+// isReadDeadlineTimeout reports whether err was triggered by a SetReadDeadline
+// elapsing. We can't just check net.Error.Timeout() because the underlying
+// conn here is a tls.Conn or our wrapper; errors.Is keeps working through
+// fmt.Errorf wraps in either case.
+func isReadDeadlineTimeout(err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, os.ErrDeadlineExceeded)
 }
 
 type DefaultResponseHandler struct {
@@ -20,8 +33,14 @@ type DefaultResponseHandler struct {
 func (handler *DefaultRequestHandler) handleRequest(dst DeadlineWriter, src DeadlineReaderWriter, ctx *RequestsLoopContext) (readErr bool, err error) {
 	// logrus.Println("Await Kafka request")
 
-	// waiting for first bytes or EOF - reset deadlines
-	if err = src.SetReadDeadline(time.Time{}); err != nil {
+	// Pick a read deadline so the request loop wakes in time to run KIP-368
+	// re-auth even on an idle connection. Zero means "no deadline" (the
+	// behaviour we had before we tracked session lifetime).
+	readDeadline := time.Time{}
+	if ctx.authState != nil {
+		readDeadline = ctx.authState.NextReadDeadline()
+	}
+	if err = src.SetReadDeadline(readDeadline); err != nil {
 		return true, err
 	}
 	if err = dst.SetWriteDeadline(time.Time{}); err != nil {
@@ -31,6 +50,18 @@ func (handler *DefaultRequestHandler) handleRequest(dst DeadlineWriter, src Dead
 	keyVersionBuf := make([]byte, 8) // Size => int32 + ApiKey => int16 + ApiVersion => int16
 
 	if _, err = io.ReadFull(src, keyVersionBuf); err != nil {
+		// Timeout on an idle connection: not an error. If re-auth is due,
+		// run it inline (this is the only goroutine that may write to dst).
+		// Then re-queue ourselves so the loop comes back to wait for client
+		// traffic with a fresh deadline.
+		if isReadDeadlineTimeout(err) {
+			if ctx.authState != nil && ctx.authState.NeedsReauth(time.Now()) {
+				if rerr := ctx.runReauth(dst); rerr != nil {
+					return false, rerr
+				}
+			}
+			return false, ctx.putNextRequestHandler(defaultRequestHandler)
+		}
 		return true, err
 	}
 
