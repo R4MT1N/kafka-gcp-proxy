@@ -2,7 +2,10 @@ package googleaccesstokenprovider
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -12,6 +15,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"golang.org/x/oauth2"
 )
+
+const testSAEmail = "svc@project.iam.gserviceaccount.com"
 
 type fakeTokenSource struct {
 	tokens []*oauth2.Token
@@ -37,47 +42,77 @@ func (f *fakeTokenSource) Token() (*oauth2.Token, error) {
 	return t, nil
 }
 
+// unwrap parses the three-part envelope and returns (header, payload, token).
+func unwrap(t *testing.T, envelope string) (map[string]any, map[string]any, string) {
+	t.Helper()
+	parts := strings.Split(envelope, ".")
+	if len(parts) != 3 {
+		t.Fatalf("envelope must have 3 parts, got %d: %q", len(parts), envelope)
+	}
+	decode := func(s string) []byte {
+		b, err := base64.RawURLEncoding.DecodeString(s)
+		if err != nil {
+			t.Fatalf("base64 decode failed for %q: %v", s, err)
+		}
+		return b
+	}
+	var header, payload map[string]any
+	if err := json.Unmarshal(decode(parts[0]), &header); err != nil {
+		t.Fatalf("header parse failed: %v", err)
+	}
+	if err := json.Unmarshal(decode(parts[1]), &payload); err != nil {
+		t.Fatalf("payload parse failed: %v", err)
+	}
+	return header, payload, string(decode(parts[2]))
+}
+
 func TestGetToken_HappyPath(t *testing.T) {
 	a := assert.New(t)
 	src := &fakeTokenSource{tokens: []*oauth2.Token{
 		{AccessToken: "ya29.fresh-token", Expiry: time.Now().Add(time.Hour)},
 	}}
-	p := &TokenProvider{timeout: 10 * time.Second, source: src}
+	p := &TokenProvider{timeout: 10 * time.Second, source: src, serviceAccountEmail: testSAEmail}
 
 	resp, err := p.GetToken(context.Background(), apis.TokenRequest{})
 	a.Nil(err)
-	a.Equal(apis.TokenResponse{Success: true, Status: int32(StatusOK), Token: "ya29.fresh-token"}, resp)
+	a.True(resp.Success)
+	a.Equal(int32(StatusOK), resp.Status)
+
+	header, payload, accessToken := unwrap(t, resp.Token)
+	a.Equal("JWT", header["typ"])
+	a.Equal("GOOG_OAUTH2_TOKEN", header["alg"])
+	a.Equal("Google", payload["iss"])
+	a.Equal(testSAEmail, payload["sub"])
+	a.Equal("ya29.fresh-token", accessToken)
 }
 
 // TestGetToken_RefreshAfterExpiry catches the most likely regression: silent
-// reuse of expired tokens. We feed two tokens through a ReuseTokenSource and
-// verify the second call returns the refreshed value once the first expires.
+// reuse of expired tokens. The first call seeds the ReuseTokenSource cache
+// with the expired token; the second call sees it's past expiry and re-fetches.
 func TestGetToken_RefreshAfterExpiry(t *testing.T) {
 	a := assert.New(t)
 	src := &fakeTokenSource{tokens: []*oauth2.Token{
 		{AccessToken: "expired", Expiry: time.Now().Add(-time.Minute)},
 		{AccessToken: "refreshed", Expiry: time.Now().Add(time.Hour)},
 	}}
-	// Wrap in ReuseTokenSource exactly as production code does. The first
-	// GetToken call seeds the cache with the expired token (ReuseTokenSource
-	// returns whatever source.Token() yields); the second call sees the
-	// cached token is past expiry and re-fetches from the underlying source.
 	reusable := oauth2.ReuseTokenSource(nil, src)
-	p := &TokenProvider{timeout: 10 * time.Second, source: reusable}
+	p := &TokenProvider{timeout: 10 * time.Second, source: reusable, serviceAccountEmail: testSAEmail}
 
 	first, err := p.GetToken(context.Background(), apis.TokenRequest{})
 	a.Nil(err)
-	a.Equal("expired", first.Token)
+	_, _, t1 := unwrap(t, first.Token)
+	a.Equal("expired", t1)
 
 	second, err := p.GetToken(context.Background(), apis.TokenRequest{})
 	a.Nil(err)
-	a.Equal("refreshed", second.Token, "ReuseTokenSource should refresh once the cached token is past expiry")
+	_, _, t2 := unwrap(t, second.Token)
+	a.Equal("refreshed", t2, "ReuseTokenSource should refresh once the cached token is past expiry")
 }
 
 func TestGetToken_FetchFailureFailsClosed(t *testing.T) {
 	a := assert.New(t)
 	src := &fakeTokenSource{err: fmt.Errorf("ADC unavailable")}
-	p := &TokenProvider{timeout: 10 * time.Second, source: src}
+	p := &TokenProvider{timeout: 10 * time.Second, source: src, serviceAccountEmail: testSAEmail}
 
 	resp, err := p.GetToken(context.Background(), apis.TokenRequest{})
 	a.Nil(err, "GetToken returns nil error and signals via Success=false")
@@ -91,7 +126,7 @@ func TestGetToken_Concurrent(t *testing.T) {
 		{AccessToken: "tok", Expiry: time.Now().Add(time.Hour)},
 	}}
 	reusable := oauth2.ReuseTokenSource(nil, src)
-	p := &TokenProvider{timeout: 10 * time.Second, source: reusable}
+	p := &TokenProvider{timeout: 10 * time.Second, source: reusable, serviceAccountEmail: testSAEmail}
 
 	var wg sync.WaitGroup
 	const N = 50
@@ -102,7 +137,8 @@ func TestGetToken_Concurrent(t *testing.T) {
 			resp, err := p.GetToken(context.Background(), apis.TokenRequest{})
 			a.Nil(err)
 			a.True(resp.Success)
-			a.Equal("tok", resp.Token)
+			_, _, accessToken := unwrap(t, resp.Token)
+			a.Equal("tok", accessToken)
 		}()
 	}
 	wg.Wait()

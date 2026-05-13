@@ -117,13 +117,9 @@ func (b *SASLOAuthBearerAuth) sendAndReceiveSASLAuth(conn DeadlineReaderWriter, 
 }
 
 func (b *SASLOAuthBearerAuth) sendSaslAuthenticateRequest(token string, conn DeadlineReaderWriter) error {
-	saslAuthBytes := SaslOAuthBearer{}.ToBytes(token, "", map[string]string{})
-	// Dump structural envelope (substitute the token itself with <TOKEN>) so we
-	// can spot SASL formatting bugs without leaking the credential.
-	envelope := bytes.ReplaceAll(saslAuthBytes, []byte(token), []byte("<TOKEN>"))
-	logrus.Debugf("Sending SaslAuthenticateRequest OAUTHBEARER token-len=%d envelope=%q raw-hex=% x", len(token), string(envelope), envelope)
+	logrus.Debugf("Sending SaslAuthenticateRequest, mechanism OAUTHBEARER")
 
-	saslAuthReqV0 := protocol.SaslAuthenticateRequestV0{SaslAuthBytes: saslAuthBytes}
+	saslAuthReqV0 := protocol.SaslAuthenticateRequestV0{SaslAuthBytes: SaslOAuthBearer{}.ToBytes(token, "", map[string]string{})}
 
 	req := &protocol.Request{
 		ClientID: b.clientID,
