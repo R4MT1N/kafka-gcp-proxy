@@ -1,7 +1,6 @@
 package proxy
 
 import (
-	"encoding/binary"
 	"errors"
 	"io"
 	"sync"
@@ -45,7 +44,6 @@ var (
 	defaultResponseHandler    = &DefaultResponseHandler{}
 	saslAuthV0RequestHandler  = &SaslAuthV0RequestHandler{}
 	saslAuthV0ResponseHandler = &SaslAuthV0ResponseHandler{}
-	saslReauthResponseHandler = &SaslReauthResponseHandler{}
 )
 
 type ProcessorConfig struct {
@@ -215,8 +213,8 @@ func newProcessor(cfg ProcessorConfig, brokerAddress string) *processor {
 		readTimeout = defaultReadTimeout
 	}
 	nextRequestHandlerChannel := make(chan RequestHandler, 1)
-	// +2 leaves room for both the default handler and a re-auth handler that
-	// the request loop may push concurrently while a normal request is queued.
+	// +2 leaves room for the pre-seeded handler plus one the request loop may
+	// push for a re-auth while a normal request is already queued.
 	nextResponseHandlerChannel := make(chan ResponseHandler, maxOpenRequests+2)
 
 	// initial handlers -> standard kafka message arrives always as first
@@ -359,21 +357,39 @@ func (r *RequestsLoopContext) runReauth(dst DeadlineWriter) error {
 	// Mark in-flight before publishing onto the channels so the request loop
 	// won't re-fire even if the response handler is delayed.
 	r.authState.MarkInFlight(now)
-	// Tell the response loop what API key/version to expect next, and which
-	// handler to use.
+	if err := r.enqueueReauthResponse(); err != nil {
+		return err
+	}
+	logrus.Debugf("re-auth: SaslAuthenticate v1 sent to %s", r.brokerAddress)
+	return nil
+}
+
+// enqueueReauthResponse tells the response loop that a proxy-initiated
+// SaslAuthenticate reply is on its way. Split out from runReauth so the
+// pairing can be tested without a live socket or a token provider.
+func (r *RequestsLoopContext) enqueueReauthResponse() error {
 	select {
 	case r.openRequestsChannel <- protocol.RequestKeyVersion{ApiKey: apiKeySaslAuthenticate, ApiVersion: saslAuthenticateRequestVersion}:
 	default:
 		proxyReauthFailuresTotal.WithLabelValues(r.brokerAddress, ReauthReasonChannelFull).Inc()
 		return errors.New("re-auth: openRequestsChannel full")
 	}
+	// A *default* handler, deliberately: every entry in this queue must be
+	// interchangeable. nextResponseHandlerChannel is pre-seeded with one
+	// handler at connection setup, so it leads openRequestsChannel by one and
+	// a handler pushed here would be popped for someone else's response. The
+	// default handler recognises the proxy's re-auth reply by its reserved
+	// correlation ID (see consumeReauthResponse) and swallows it there, which
+	// makes the pairing depend only on openRequestsChannel — and that one is
+	// strictly in wire order, because the broker answers a connection in
+	// order. Pushing one handler per enqueued marker also keeps the queue
+	// from starving on the second re-auth.
 	select {
-	case r.nextResponseHandlerChannel <- saslReauthResponseHandler:
+	case r.nextResponseHandlerChannel <- defaultResponseHandler:
 	default:
 		proxyReauthFailuresTotal.WithLabelValues(r.brokerAddress, ReauthReasonChannelFull).Inc()
 		return errors.New("re-auth: nextResponseHandlerChannel full")
 	}
-	logrus.Debugf("re-auth: SaslAuthenticate v1 sent to %s", r.brokerAddress)
 	return nil
 }
 
@@ -451,42 +467,33 @@ func (r *ResponsesLoopContext) getNextResponseHandler() (ResponseHandler, error)
 	}
 }
 
-// SaslReauthResponseHandler consumes the broker's reply to a proxy-initiated
-// SaslAuthenticate v1, updates the per-connection auth state with the new
-// session_lifetime_ms, and writes nothing to the client.
-//
-// The kafka header for an in-flight request also has to be drained off the
-// openRequestsChannel. We do that here so the channel queue stays aligned with
-// the response stream.
-type SaslReauthResponseHandler struct{}
+// isProxyReauthResponse reports whether the frame the response loop is holding
+// is the reply to a SaslAuthenticate the *proxy* sent for KIP-368 re-auth, as
+// opposed to one a SASL-speaking client sent through us. Both carry ApiKey 36;
+// only ours carries the reserved correlation ID.
+func isProxyReauthResponse(requestKeyVersion *protocol.RequestKeyVersion, responseHeader protocol.ResponseHeader) bool {
+	return requestKeyVersion.ApiKey == apiKeySaslAuthenticate &&
+		responseHeader.CorrelationID == reauthCorrelationID
+}
 
-func (h *SaslReauthResponseHandler) handleResponse(dst DeadlineWriter, src DeadlineReader, ctx *ResponsesLoopContext) (readErr bool, err error) {
+// consumeReauthResponse reads the rest of a proxy-initiated SaslAuthenticate
+// reply off the broker connection, updates the per-connection auth state with
+// the new session_lifetime_ms, and writes NOTHING to the client — the client
+// never sent this request and would kill its own connection if it saw the
+// reply (Kafka's NetworkClient panics the poll thread with "There are no
+// in-flight requests for node N").
+//
+// The 8-byte response header (Size + CorrelationID) has already been read by
+// the caller, so we pick up at the body.
+func (ctx *ResponsesLoopContext) consumeReauthResponse(src DeadlineReader, responseHeader protocol.ResponseHeader) (readErr bool, err error) {
 	if err = src.SetReadDeadline(time.Now().Add(ctx.timeout)); err != nil {
 		return true, err
 	}
-	// Drain the matching request marker so subsequent default responses pair
-	// correctly. If it isn't there we're out of sync — fail loud.
-	select {
-	case rkv := <-ctx.openRequestsChannel:
-		if rkv.ApiKey != apiKeySaslAuthenticate {
-			return false, errors.New("re-auth: openRequestsChannel out of sync; expected SaslAuthenticate marker")
-		}
-	default:
-		return false, errors.New("re-auth: openRequestsChannel empty when SaslAuthenticate response expected")
-	}
-
-	// Standard length-prefixed frame: Size:int32, CorrelationID:int32, body.
-	header := make([]byte, 8)
-	if _, err = io.ReadFull(src, header); err != nil {
-		proxyReauthFailuresTotal.WithLabelValues(ctx.brokerAddress, ReauthReasonResponseDecode).Inc()
-		return true, err
-	}
-	length := binary.BigEndian.Uint32(header[:4])
-	if length < 4 {
+	if responseHeader.Length < 4 {
 		proxyReauthFailuresTotal.WithLabelValues(ctx.brokerAddress, ReauthReasonResponseDecode).Inc()
 		return true, errors.New("re-auth: response too short")
 	}
-	payload := make([]byte, length-4)
+	payload := make([]byte, responseHeader.Length-4) // minus the CorrelationID
 	if _, err = io.ReadFull(src, payload); err != nil {
 		proxyReauthFailuresTotal.WithLabelValues(ctx.brokerAddress, ReauthReasonResponseDecode).Inc()
 		return true, err

@@ -198,6 +198,14 @@ func (handler *DefaultResponseHandler) handleResponse(dst DeadlineWriter, src De
 	if err != nil {
 		return true, err
 	}
+	// A proxy-initiated KIP-368 re-auth reply is ours, not the client's: read
+	// the rest of it here and write nothing downstream. This has to happen
+	// before any tagged-field / response-modifier handling below, which
+	// assumes a client-visible response.
+	if isProxyReauthResponse(requestKeyVersion, responseHeader) {
+		return ctx.consumeReauthResponse(src, responseHeader)
+	}
+
 	proxyResponsesBytes.WithLabelValues(ctx.brokerAddress).Add(float64(responseHeader.Length + 4))
 	logrus.Debugf("Kafka response key %v, version %v, length %v", requestKeyVersion.ApiKey, requestKeyVersion.ApiVersion, responseHeader.Length)
 
