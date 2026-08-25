@@ -3,6 +3,7 @@ package proxy
 import (
 	"errors"
 	"io"
+	"strings"
 	"sync"
 	"time"
 
@@ -341,12 +342,30 @@ func (r *RequestsLoopContext) runReauth(dst DeadlineWriter) error {
 	}
 	proxyReauthAttemptsTotal.WithLabelValues(r.brokerAddress).Inc()
 
+	// KIP-368 re-authentication is SaslHandshake THEN SaslAuthenticate on the
+	// live connection. A bare SaslAuthenticate is refused by the broker with
+	// "Request is not valid given the current SASL state (SaslAuthenticate
+	// request received after successful authentication)".
+	handshakeBytes, err := r.saslAuthByProxy.buildReauthHandshakeRequest(reauthHandshakeCorrelationID)
+	if err != nil {
+		proxyReauthFailuresTotal.WithLabelValues(r.brokerAddress, ReauthReasonBrokerWrite).Inc()
+		return err
+	}
 	reqBytes, err := r.saslAuthByProxy.buildReauthRequest(reauthCorrelationID)
 	if err != nil {
 		proxyReauthFailuresTotal.WithLabelValues(r.brokerAddress, ReauthReasonTokenFetch).Inc()
 		return err
 	}
 	if err := dst.SetWriteDeadline(now.Add(r.timeout)); err != nil {
+		proxyReauthFailuresTotal.WithLabelValues(r.brokerAddress, ReauthReasonBrokerWrite).Inc()
+		return err
+	}
+	// Written back to back: a broker serves one connection in order, so the
+	// handshake is processed (and the SASL state machine re-armed) before the
+	// authenticate lands. Waiting for the handshake reply here is not an
+	// option — this goroutine owns the write side, the response loop owns the
+	// read side.
+	if _, err := dst.Write(handshakeBytes); err != nil {
 		proxyReauthFailuresTotal.WithLabelValues(r.brokerAddress, ReauthReasonBrokerWrite).Inc()
 		return err
 	}
@@ -368,8 +387,16 @@ func (r *RequestsLoopContext) runReauth(dst DeadlineWriter) error {
 // SaslAuthenticate reply is on its way. Split out from runReauth so the
 // pairing can be tested without a live socket or a token provider.
 func (r *RequestsLoopContext) enqueueReauthResponse() error {
+	// Both legs of the exchange, in the order the broker will answer them.
+	if err := r.enqueueReauthMarker(protocol.RequestKeyVersion{ApiKey: apiKeySaslHandshake, ApiVersion: saslHandshakeRequestVersion}); err != nil {
+		return err
+	}
+	return r.enqueueReauthMarker(protocol.RequestKeyVersion{ApiKey: apiKeySaslAuthenticate, ApiVersion: saslAuthenticateRequestVersion})
+}
+
+func (r *RequestsLoopContext) enqueueReauthMarker(rkv protocol.RequestKeyVersion) error {
 	select {
-	case r.openRequestsChannel <- protocol.RequestKeyVersion{ApiKey: apiKeySaslAuthenticate, ApiVersion: saslAuthenticateRequestVersion}:
+	case r.openRequestsChannel <- rkv:
 	default:
 		proxyReauthFailuresTotal.WithLabelValues(r.brokerAddress, ReauthReasonChannelFull).Inc()
 		return errors.New("re-auth: openRequestsChannel full")
@@ -467,13 +494,43 @@ func (r *ResponsesLoopContext) getNextResponseHandler() (ResponseHandler, error)
 	}
 }
 
+// completeReauthHandshake checks the broker's reply to the SaslHandshake leg of
+// a re-auth. Nothing is written to the client and no state advances — the
+// handshake only re-arms the broker's SASL state machine so the
+// SaslAuthenticate already on the wire behind it is accepted.
+func (ctx *ResponsesLoopContext) completeReauthHandshake(payload []byte) (readErr bool, err error) {
+	res := &protocol.SaslHandshakeResponseV0orV1{}
+	if err := protocol.Decode(payload, res); err != nil {
+		proxyReauthFailuresTotal.WithLabelValues(ctx.brokerAddress, ReauthReasonResponseDecode).Inc()
+		return true, err
+	}
+	if !errors.Is(res.Err, protocol.ErrNoError) {
+		proxyReauthFailuresTotal.WithLabelValues(ctx.brokerAddress, ReauthReasonBrokerReject).Inc()
+		proxyConnectionTeardownTotal.WithLabelValues(ctx.brokerAddress, "reauth_broker_reject").Inc()
+		// Tear the connection down: the SaslAuthenticate queued behind this
+		// handshake cannot succeed, and leaving the connection up would let
+		// the client keep sending on credentials that are about to lapse.
+		return false, errors.New("re-auth: broker rejected the handshake: " + res.Err.Error() +
+			" (broker offers " + strings.Join(res.EnabledMechanisms, ",") + ")")
+	}
+	logrus.Debugf("re-auth: handshake accepted on %s", ctx.brokerAddress)
+	return false, nil
+}
+
 // isProxyReauthResponse reports whether the frame the response loop is holding
-// is the reply to a SaslAuthenticate the *proxy* sent for KIP-368 re-auth, as
-// opposed to one a SASL-speaking client sent through us. Both carry ApiKey 36;
-// only ours carries the reserved correlation ID.
+// is a reply to one of the requests the *proxy* injected for KIP-368 re-auth,
+// as opposed to one a SASL-speaking client sent through us. A client's SASL
+// traffic carries the same API keys; only ours carries the reserved
+// correlation IDs.
 func isProxyReauthResponse(requestKeyVersion *protocol.RequestKeyVersion, responseHeader protocol.ResponseHeader) bool {
-	return requestKeyVersion.ApiKey == apiKeySaslAuthenticate &&
-		responseHeader.CorrelationID == reauthCorrelationID
+	return isProxyReauthHandshakeResponse(requestKeyVersion, responseHeader) ||
+		(requestKeyVersion.ApiKey == apiKeySaslAuthenticate &&
+			responseHeader.CorrelationID == reauthCorrelationID)
+}
+
+func isProxyReauthHandshakeResponse(requestKeyVersion *protocol.RequestKeyVersion, responseHeader protocol.ResponseHeader) bool {
+	return requestKeyVersion.ApiKey == apiKeySaslHandshake &&
+		responseHeader.CorrelationID == reauthHandshakeCorrelationID
 }
 
 // consumeReauthResponse reads the rest of a proxy-initiated SaslAuthenticate
@@ -497,6 +554,10 @@ func (ctx *ResponsesLoopContext) consumeReauthResponse(src DeadlineReader, respo
 	if _, err = io.ReadFull(src, payload); err != nil {
 		proxyReauthFailuresTotal.WithLabelValues(ctx.brokerAddress, ReauthReasonResponseDecode).Inc()
 		return true, err
+	}
+
+	if responseHeader.CorrelationID == reauthHandshakeCorrelationID {
+		return ctx.completeReauthHandshake(payload)
 	}
 
 	res := &protocol.SaslAuthenticateResponseV1{}

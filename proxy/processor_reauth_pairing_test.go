@@ -93,11 +93,12 @@ func TestReauthResponseIsNotForwardedToClient(t *testing.T) {
 	}
 	a.NoError(reqCtx.enqueueReauthResponse())
 
-	// The broker answers in order: the client's request, then the re-auth.
-	src := &fakeBrokerReader{r: bytes.NewReader(append(
-		frame(7, clientPayload),
-		saslReauthResponseFrame(t, 60_000)...,
-	))}
+	// The broker answers in order: the client's request, then both legs of the
+	// re-auth exchange.
+	stream := frame(7, clientPayload)
+	stream = append(stream, handshakeResponseFrame(t, protocol.ErrNoError)...)
+	stream = append(stream, saslReauthResponseFrame(t, 60_000)...)
+	src := &fakeBrokerReader{r: bytes.NewReader(stream)}
 	dst := &fakeClientWriter{}
 
 	_, err := ctx.responsesLoop(dst, src)
@@ -127,7 +128,10 @@ func TestReauthResponseIsNotForwardedOnIdleConnection(t *testing.T) {
 	}
 	a.NoError(reqCtx.enqueueReauthResponse())
 
-	src := &fakeBrokerReader{r: bytes.NewReader(saslReauthResponseFrame(t, 60_000))}
+	src := &fakeBrokerReader{r: bytes.NewReader(append(
+		handshakeResponseFrame(t, protocol.ErrNoError),
+		saslReauthResponseFrame(t, 60_000)...,
+	))}
 	dst := &fakeClientWriter{}
 
 	_, err := ctx.responsesLoop(dst, src)
@@ -191,6 +195,7 @@ func TestRepeatedReauthDoesNotStarveHandlerQueue(t *testing.T) {
 
 		authState.MarkInFlight(time.Now())
 		a.NoError(reqCtx.enqueueReauthResponse())
+		stream = append(stream, handshakeResponseFrame(t, protocol.ErrNoError)...)
 		stream = append(stream, saslReauthResponseFrame(t, 60_000)...)
 	}
 

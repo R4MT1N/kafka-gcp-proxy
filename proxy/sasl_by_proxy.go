@@ -22,10 +22,17 @@ const (
 	// same TCP connection before the broker force-closes it.
 	saslAuthenticateRequestVersion = int16(1)
 
-	// Sentinel correlation ID used for proxy-injected re-auth requests. Picked
+	// SaslHandshake v1 is what the initial auth path negotiates, and re-auth
+	// has to open with the same version.
+	saslHandshakeRequestVersion = int16(1)
+
+	// Sentinel correlation IDs used for proxy-injected re-auth requests. Picked
 	// at the top of the int32 range so it's effectively impossible for a real
-	// Kafka client to collide with it (clients increment from 0).
-	reauthCorrelationID = int32(0x7FFFFFFE)
+	// Kafka client to collide with them (clients increment from 0). They are
+	// also how the response loop tells our own re-auth replies apart from a
+	// SASL-speaking client's — see isProxyReauthResponse.
+	reauthCorrelationID          = int32(0x7FFFFFFE)
+	reauthHandshakeCorrelationID = int32(0x7FFFFFFD)
 )
 
 type SASLHandshake struct {
@@ -55,12 +62,18 @@ type SASLAuthByProxy interface {
 	// broker advertised; 0 means the broker does not require re-authentication.
 	sendAndReceiveSASLAuth(conn DeadlineReaderWriter, brokerAddress string) (int64, error)
 
+	// buildReauthHandshakeRequest produces the framed bytes for the
+	// SaslHandshake v1 that MUST precede the SaslAuthenticate on a live
+	// connection. KIP-368 re-authentication is handshake-then-authenticate;
+	// a bare SaslAuthenticate on an authenticated connection is rejected with
+	// "Request is not valid given the current SASL state".
+	buildReauthHandshakeRequest(correlationID int32) ([]byte, error)
+
 	// buildReauthRequest produces the framed bytes (length prefix + request
 	// header + body) for a SaslAuthenticate v1 carrying a fresh token. The
 	// caller writes those bytes onto a live broker connection while the rest
-	// of the proxy is paused; the response is consumed by a dedicated handler
-	// in the response loop. The correlation ID lets the proxy match the
-	// response off the wire if needed.
+	// of the proxy is paused; the response is consumed by the response loop,
+	// which recognises it by correlation ID.
 	buildReauthRequest(correlationID int32) ([]byte, error)
 }
 
@@ -187,6 +200,26 @@ func (b *SASLOAuthBearerAuth) sendSaslAuthenticateRequest(token string, conn Dea
 		logrus.Infof("SASL authenticated; broker session_lifetime_ms=%d", res.SessionLifetimeMs)
 	}
 	return res.SessionLifetimeMs, nil
+}
+
+// buildReauthHandshakeRequest packages the SaslHandshake v1 that opens a
+// re-authentication exchange on an already-authenticated connection. The
+// broker answers it, re-arms its SASL state machine, and only then accepts the
+// SaslAuthenticate that follows.
+func (b *SASLOAuthBearerAuth) buildReauthHandshakeRequest(correlationID int32) ([]byte, error) {
+	req := &protocol.Request{
+		CorrelationID: correlationID,
+		ClientID:      b.clientID,
+		Body:          &protocol.SaslHandshakeRequestV0orV1{Version: 1, Mechanism: SASLOAuthBearer},
+	}
+	reqBuf, err := protocol.Encode(req)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]byte, 4+len(reqBuf))
+	binary.BigEndian.PutUint32(out[:4], uint32(len(reqBuf)))
+	copy(out[4:], reqBuf)
+	return out, nil
 }
 
 // buildReauthRequest packages a SaslAuthenticate v1 with a fresh token plus
